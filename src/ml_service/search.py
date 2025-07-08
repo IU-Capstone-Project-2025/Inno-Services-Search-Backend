@@ -1,8 +1,8 @@
 import asyncio
+import re
 import time
 
 import lancedb
-import pandas as pd
 from langdetect import detect
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
 
@@ -23,170 +23,193 @@ def translate_to_russian(text: str) -> str:
     return tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
 
 
+async def search_maps(
+    tbl,
+    query_text: str,
+    query_emb,
+    limit: int,
+    area_id: str | None = None,
+) -> list[dict]:
+    """
+    1) Full-text search on map chunks
+    2) Vector search on the same table
+    3) If area_id given, prioritize those chunks
+    4) Merge + dedupe by mongo_id
+    """
+    # 1) Full-text search
+    try:
+        fts_hits = await tbl.search_text(query_text).limit(limit).to_pylist()
+    except Exception:
+        fts_hits = []
+    fts_results = [
+        {
+            "resource": InfoSources.maps.value,
+            "mongo_id": hit["mongo_id"],
+            "score": float(hit.get("_score", hit.get("_relevance_score", 0.0))),
+            "content": clean_text(hit["content"]),
+            "chunk_number": hit.get("chunk_number", 0),
+        }
+        for hit in fts_hits
+    ]
+
+    # 2) Vector search
+    emb_df = (
+        await tbl.query()
+        .nearest_to(query_emb)
+        .distance_type("cosine")
+        .limit(settings.ml_service.bi_encoder_search_limit_per_table)
+        .to_pandas()
+    )
+    emb_df["score"] = 1 - emb_df["_distance"]
+
+    # 3) Если area_id указан — фильтруем по нему
+    if area_id:
+        mask = emb_df["content"].str.contains(f'area_id="{area_id}"')
+        filtered = emb_df[mask]
+        chosen = filtered if not filtered.empty else emb_df
+    else:
+        chosen = emb_df
+
+    emb_selected = chosen.sort_values("score", ascending=False).head(limit)
+    emb_results = [
+        {
+            "resource": InfoSources.maps.value,
+            "mongo_id": row["mongo_id"],
+            "score": float(row["score"]),
+            "content": clean_text(row["content"]),
+            "chunk_number": row.get("chunk_number", 0),
+        }
+        for _, row in emb_selected.iterrows()
+    ]
+
+    # 4) Merge + dedupe by mongo_id, keep highest score
+    combined = fts_results + emb_results
+    unique: dict[str, dict] = {}
+    for r in combined:
+        key = r["mongo_id"]
+        if key not in unique or r["score"] > unique[key]["score"]:
+            unique[key] = r
+
+    return list(unique.values())
+
+
 async def search_pipeline(
     query: str,
-    resources: list[InfoSources],
+    resources: list[InfoSources] = ALL_SOURCES,
     limit: int = 5,
 ):
     start_time = time.perf_counter()
-    logger.info(f"🔍 Searching for {query} in {resources}")
+    logger.info(f"🔍 Searching for {query!r} in {resources}")
 
     original_query = query
+    # detect language
     try:
         query_lang = detect(query)
     except Exception as e:
-        logger.warning(f"🌐 Language detection failed: {e}")
+        logger.warning(f"Language detection failed: {e}")
         query_lang = None
 
+    # translate if needed
     if query_lang == "en" and InfoSources.residents in resources:
-        logger.info("🌍 English query + 'residents' → переводим на русский")
+        logger.info("Translating English query for residents resource")
         search_query = translate_to_russian(query)
-        logger.info(f"📝 Translated query: {search_query}")
+        logger.info(f"Translated query: {search_query!r}")
     else:
         search_query = query
 
-    # Time bi-encoder encoding
-    bi_encoder_start = time.perf_counter()
+    # prepare embedding
+    bi_start = time.perf_counter()
+    cleaned = clean_text(search_query)
     if settings.ml_service.infinity_url:
-        import src.ml_service.infinity
-
-        query_emb = (
-            await src.ml_service.infinity.embed(
-                [clean_text(search_query)],
-                task="query",
-            )
-        )[0]
+        import src.ml_service.infinity as svc
     else:
-        import src.ml_service.non_infinity
+        import src.ml_service.non_infinity as svc
+    query_emb = (await svc.embed([cleaned], task="query"))[0]
+    bi_time = time.perf_counter() - bi_start
+    logger.info(f"⏱️ Bi-encoder: {bi_time:.3f}s")
 
-        query_emb = (
-            await src.ml_service.non_infinity.embed(
-                [clean_text(search_query)],
-                task="query",
-            )
-        )[0]
-    bi_encoder_time = time.perf_counter() - bi_encoder_start
-    logger.info(f"⏱️  Bi-encoder encoding: {bi_encoder_time:.3f}s")
-
-    all_results = []
-    db_query_start = time.perf_counter()
     lance_db = await lancedb.connect_async(settings.ml_service.lancedb_uri)
-    for resource in resources:
-        resource_start = time.perf_counter()
-        tbl_name = f"chunks_{resource}"
-        if tbl_name not in await lance_db.table_names():
+    all_results: list[dict] = []
+    area_pattern = re.compile(r"(\d+(?:[.,]\d+)?)")
+    area_match = area_pattern.search(query)
+    area_id = area_match.group(1).replace(",", ".") if area_match else None
+
+    # iterate over tables
+    db_start = time.perf_counter()
+    for res in resources:
+        table_name = f"chunks_{res.value}"
+        if table_name not in await lance_db.table_names():
             continue
-        tbl = await lance_db.open_table(tbl_name)
-        results: pd.DataFrame = (
-            await tbl.query()
-            .nearest_to(query_emb)
-            .distance_type("cosine")
-            # .nearest_to_text(query) TODO: For now it will not work if /tmp and /home are on different partitions: https://github.com/lancedb/lancedb/issues/2461
-            .limit(settings.ml_service.bi_encoder_search_limit_per_table)
-            .to_pandas()
-        )
-        resource_time = time.perf_counter() - resource_start
-        logger.info(f"⏱️  {resource} query: {resource_time:.3f}s")
-        logger.info(f"\nRaw results for {resource}:\n{results.drop(columns=['embedding']).head(3)}")
-        for _, row in results.iterrows():
-            if "_relevance_score" in row:
-                score = row["_relevance_score"]
-            elif "_score" in row:
-                score = row["_score"]
-            elif "_distance" in row:
-                score = 1 - row["_distance"]
-            else:
-                score = 0
 
-            all_results.append(
-                {
-                    "resource": resource,
-                    "mongo_id": row["mongo_id"],
-                    "score": score,
-                    "content": clean_text(row["content"]),
-                }
-            )
-    db_query_time = time.perf_counter() - db_query_start
-    logger.info(f"⏱️  Total database queries: {db_query_time:.3f}s")
-    logger.info(f"🔍 Found {len(all_results)} results")
+        tbl = await lance_db.open_table(table_name)
 
-    # Rerank with cross encoder
-    cross_encoder_time = 0
-    if all_results:
-        logger.info("🔄 Reranking with cross encoder...")
-        cross_encoder_start = time.perf_counter()
-        documents = [result["content"] for result in all_results]
-
-        if settings.ml_service.infinity_url:
-            import src.ml_service.infinity
-
-            rankings = await src.ml_service.infinity.rerank(
-                clean_text(query),
-                documents,
-                top_n=limit,
-            )
+        if res is InfoSources.maps:
+            # для карт — комбинированный FTS+vector
+            maps_hits = await search_maps(tbl, search_query, query_emb, limit, area_id)
+            all_results.extend(maps_hits)
         else:
-            import src.ml_service.non_infinity
-
-            rankings = await src.ml_service.non_infinity.rerank(
-                clean_text(query),
-                documents,
-                top_n=limit,
+            # только векторный поиск
+            df = (
+                await tbl.query()
+                .nearest_to(query_emb)
+                .distance_type("cosine")
+                .limit(settings.ml_service.bi_encoder_search_limit_per_table)
+                .to_pandas()
             )
+            for _, row in df.iterrows():
+                score = row.get("_relevance_score") or row.get("_score") or (1 - row.get("_distance", 1))
+                all_results.append(
+                    {
+                        "resource": res.value,
+                        "mongo_id": row["mongo_id"],
+                        "score": float(score),
+                        "content": clean_text(row["content"]),
+                        "chunk_number": row.get("chunk_number", 0),
+                    }
+                )
 
-        cross_encoder_time = time.perf_counter() - cross_encoder_start
-        logger.info(f"⏱️  Cross-encoder reranking: {cross_encoder_time:.3f}s")
+    db_time = time.perf_counter() - db_start
+    logger.info(f"⏱️ DB queries: {db_time:.3f}s, items: {len(all_results)}")
 
-        # Create reranked results based on cross encoder rankings
-        reranked_results = []
-        for ranking in rankings:
-            original_result = all_results[ranking.index]
-            reranked_results.append(
-                {
-                    "resource": original_result["resource"],
-                    "mongo_id": original_result["mongo_id"],
-                    "score": ranking.relevance_score,
-                    "content": clean_text(original_result["content"]),
-                }
-            )
+    # rerank with cross-encoder
+    cross_time = 0.0
+    if all_results:
+        logger.info("🔄 Cross-encoder reranking…")
+        docs = [r["content"] for r in all_results]
+        cross_start = time.perf_counter()
+        rankings = await svc.rerank(clean_text(query), docs, top_n=limit)
+        cross_time = time.perf_counter() - cross_start
 
-        all_results = reranked_results
-        logger.info(f"🔄 Cross encoder reranking completed for {len(all_results)} results")
+        # rebuild list in ranked order
+        reranked = []
+        for rank in rankings:
+            orig = all_results[rank.index]
+            reranked.append({**orig, "score": float(rank.relevance_score)})
+        all_results = reranked
+    logger.info(f"⏱️ Cross-encoder: {cross_time:.3f}s")
 
-    # Deduplicate chunks per document (resource, mongo_id), keep highest bi-encoder score
+    # dedupe across resources
     unique: dict[tuple[str, str], dict] = {}
-    for result in all_results:
-        key = (result["resource"], result["mongo_id"])
-        # if this document is new or has a higher score than previously seen
-        if key not in unique or result["score"] > unique[key]["score"]:
-            unique[key] = result
-    # rebuild list from map values
-    all_results = list(unique.values())
-    # sort deduplicated results by score descending
-    all_results.sort(key=lambda r: r["score"], reverse=True)
+    for r in all_results:
+        key = (r["resource"], r["mongo_id"])
+        if key not in unique or r["score"] > unique[key]["score"]:
+            unique[key] = r
+    final = sorted(unique.values(), key=lambda x: x["score"], reverse=True)
 
-    total_time = time.perf_counter() - start_time
-    logger.info(f"⏱️  Total search pipeline: {total_time:.3f}s")
-    logger.info(
-        f"⏱️  Breakdown: Bi-encoder ({bi_encoder_time:.3f}s) + DB queries ({db_query_time:.3f}s) + Cross-encoder ({cross_encoder_time:.3f}s) = {total_time:.3f}s"
-    )
-
-    # Results are already sorted by cross encoder scores (highest first)
-    lang_map = {"en": "English", "ru": "Russian", "fr": "French"}
-    query_lang_name = lang_map.get(query_lang, "the same language as the input question")
+    total = time.perf_counter() - start_time
+    logger.info(f"⏱️ Total pipeline: {total:.3f}s")
 
     return {
-        "results": all_results,
+        "results": final,
         "original_query": original_query,
         "query_lang": query_lang,
-        "query_lang_name": query_lang_name,
+        "query_lang_name": {"en": "English", "ru": "Russian"}.get(query_lang, "other"),
     }
 
 
 if __name__ == "__main__":
     logger.info("📥 Starting search pipeline…")
     q = "How much does room for 2 people rent cost?"
-    results = asyncio.run(search_pipeline(q, resources=ALL_SOURCES))
-
-    for i, r in enumerate(results, 1):
+    data = asyncio.run(search_pipeline(q, resources=ALL_SOURCES))
+    for i, r in enumerate(data["results"], 1):
         logger.info(f"{i}. ({r['resource']}) [{r['score']:.3f}]: {r['content']}")
