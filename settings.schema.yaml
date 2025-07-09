@@ -165,6 +165,11 @@ $defs:
         description: Timeout in seconds for API requests
         title: Timeout
         type: number
+      api_music_url:
+        default: https://innohassle.ru/music-room/api
+        description: URL of ml service API music-room
+        title: Api Music Url
+        type: string
     required:
     - api_key
     - mongo_url

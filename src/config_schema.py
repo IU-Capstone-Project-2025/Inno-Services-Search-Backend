@@ -75,6 +75,9 @@ class MlServiceSettings(CustomModel):
     timeout: float = 10.0
     "Timeout in seconds for API requests"
 
+    api_music_url: str = "https://innohassle.ru/music-room/api"
+    "URL of ml service API music-room"
+
 
 class Settings(CustomModel):
     schema_: str = Field(None, alias="$schema")
